@@ -4,7 +4,7 @@ import Darwin
 
 public struct RoutingRecord: Codable, Identifiable, Hashable, Sendable {
     public let id: UUID
-    public let originalPath: String
+    public var originalPath: String
     public var destinationPath: String
     public var category: FileCategory
     public let routedAt: Date
@@ -14,6 +14,10 @@ public struct RoutingRecord: Codable, Identifiable, Hashable, Sendable {
     public let sourceFileSize: Int64?
     public var tags: [SmartTag]?
     public let sourceContentHash: String?
+    public let sourceID: String?
+    public var sourceIdentity: FileIdentitySnapshot?
+    public var sourcePOSIXIdentity: POSIXFileIdentity?
+    public var referenceIdentity: SymbolicLinkIdentitySnapshot?
 
     public init(
         id: UUID = UUID(),
@@ -26,7 +30,11 @@ public struct RoutingRecord: Codable, Identifiable, Hashable, Sendable {
         origin: FileOrigin = .unknown,
         sourceFileSize: Int64? = nil,
         tags: [SmartTag] = [],
-        sourceContentHash: String? = nil
+        sourceContentHash: String? = nil,
+        sourceID: String? = nil,
+        sourceIdentity: FileIdentitySnapshot? = nil,
+        sourcePOSIXIdentity: POSIXFileIdentity? = nil,
+        referenceIdentity: SymbolicLinkIdentitySnapshot? = nil
     ) {
         self.id = id
         self.originalPath = originalPath
@@ -39,6 +47,10 @@ public struct RoutingRecord: Codable, Identifiable, Hashable, Sendable {
         self.sourceFileSize = sourceFileSize
         self.tags = tags
         self.sourceContentHash = sourceContentHash
+        self.sourceID = sourceID
+        self.sourceIdentity = sourceIdentity
+        self.sourcePOSIXIdentity = sourcePOSIXIdentity
+        self.referenceIdentity = referenceIdentity
     }
 
     public var isRestored: Bool { restoredAt != nil }
@@ -115,6 +127,7 @@ public struct RoutingService: Sendable {
         operation: RoutingOperation = .move,
         origin: FileOrigin = .unknown,
         tags: [SmartTag] = [],
+        sourceID: String? = nil,
         expectedIdentity: FileIdentitySnapshot? = nil
     ) throws -> RoutingRecord {
         try prepareLibrary(at: libraryRoot)
@@ -124,8 +137,10 @@ public struct RoutingService: Sendable {
         // Validate only after all destination preparation, immediately before
         // touching the source. This keeps the path-based TOCTOU window narrow.
         let sourceIdentity = try validateSource(source, expectedIdentity: expectedIdentity)
+        let sourcePOSIXIdentity = try POSIXFileIdentity.captureRegularFile(at: source)
         let sourceSize: Int64? = sourceIdentity.size
         let sourceContentHash = operation == .copy ? Self.sha256(of: source) : nil
+        var referenceIdentity: SymbolicLinkIdentitySnapshot?
         if operation == .copy, sourceContentHash == nil {
             throw RoutingError.copyChanged
         }
@@ -168,6 +183,12 @@ public struct RoutingService: Sendable {
                 try? FileManager.default.removeItem(at: destination)
                 throw RoutingError.referenceChanged
             }
+            do {
+                referenceIdentity = try SymbolicLinkIdentitySnapshot.capture(at: destination)
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                throw RoutingError.referenceChanged
+            }
         }
 
         return RoutingRecord(
@@ -178,7 +199,11 @@ public struct RoutingService: Sendable {
             origin: origin,
             sourceFileSize: sourceSize,
             tags: tags,
-            sourceContentHash: sourceContentHash
+            sourceContentHash: sourceContentHash,
+            sourceID: sourceID,
+            sourceIdentity: sourceIdentity,
+            sourcePOSIXIdentity: sourcePOSIXIdentity,
+            referenceIdentity: referenceIdentity
         )
     }
 
@@ -226,6 +251,7 @@ public struct RoutingService: Sendable {
             operation: operation ?? item.routingOperation,
             origin: item.origin,
             tags: tags ?? item.tags,
+            sourceID: item.sourceID,
             expectedIdentity: item.fileIdentitySnapshot
         )
     }

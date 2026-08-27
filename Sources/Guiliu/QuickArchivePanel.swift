@@ -214,14 +214,21 @@ private struct QuickArchivePanelView: View {
             }
 
             HStack(spacing: 9) {
-                if item.routingOperation == .move {
+                if item.routingOperation != .copy {
                     Button(action: delete) {
-                        Label("删除", systemImage: "trash")
+                        Label(
+                            item.routingOperation == .reference ? "原件移到废纸篓" : "移到废纸篓",
+                            systemImage: "trash"
+                        )
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.red)
-                    .help("移到废纸篓，可从操作记录恢复")
-                    .accessibilityLabel("将文件移到废纸篓")
+                    .help(item.routingOperation == .reference
+                        ? "将 App 原件移到废纸篓，可从操作记录恢复"
+                        : "移到废纸篓，可从操作记录恢复")
+                    .accessibilityLabel(item.routingOperation == .reference
+                        ? "将 App 原件移到废纸篓"
+                        : "将文件移到废纸篓")
                 }
                 Button("在归流中查看", action: openInbox)
                     .buttonStyle(.borderless)

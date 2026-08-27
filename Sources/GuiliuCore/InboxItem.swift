@@ -68,6 +68,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
     public let resourceIdentifier: String?
     public let resourceIdentifierSession: String?
     public let persistentIdentity: PersistentFileIdentity?
+    public let posixIdentity: POSIXFileIdentity?
     public let aiSummary: String?
     public let aiModel: String?
     public let aiAnalyzedAt: Date?
@@ -87,6 +88,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
         resourceIdentifier: String? = nil,
         resourceIdentifierSession: String? = nil,
         persistentIdentity: PersistentFileIdentity? = nil,
+        posixIdentity: POSIXFileIdentity? = nil,
         aiSummary: String? = nil,
         aiModel: String? = nil,
         aiAnalyzedAt: Date? = nil
@@ -105,6 +107,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
         self.resourceIdentifier = resourceIdentifier
         self.resourceIdentifierSession = resourceIdentifierSession
         self.persistentIdentity = persistentIdentity
+        self.posixIdentity = posixIdentity
         self.aiSummary = aiSummary
         self.aiModel = aiModel
         self.aiAnalyzedAt = aiAnalyzedAt
@@ -120,7 +123,10 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
         )
     }
 
-    public func replacingFileIdentity(with snapshot: FileIdentitySnapshot) -> InboxItem {
+    public func replacingFileIdentity(
+        with snapshot: FileIdentitySnapshot,
+        posixIdentity: POSIXFileIdentity?
+    ) -> InboxItem {
         InboxItem(
             id: id,
             url: url,
@@ -136,6 +142,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
             resourceIdentifier: snapshot.resourceIdentifier,
             resourceIdentifierSession: snapshot.resourceIdentifierSession,
             persistentIdentity: snapshot.persistentIdentity,
+            posixIdentity: posixIdentity,
             aiSummary: aiSummary,
             aiModel: aiModel,
             aiAnalyzedAt: aiAnalyzedAt
@@ -158,6 +165,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
             resourceIdentifier: resourceIdentifier,
             resourceIdentifierSession: resourceIdentifierSession,
             persistentIdentity: persistentIdentity,
+            posixIdentity: posixIdentity,
             aiSummary: aiSummary,
             aiModel: aiModel,
             aiAnalyzedAt: aiAnalyzedAt
@@ -180,6 +188,7 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
             resourceIdentifier: resourceIdentifier,
             resourceIdentifierSession: resourceIdentifierSession,
             persistentIdentity: persistentIdentity,
+            posixIdentity: posixIdentity,
             aiSummary: analysis.summary,
             aiModel: analysis.model,
             aiAnalyzedAt: analysis.analyzedAt

@@ -20,7 +20,6 @@ struct CategoryView: View {
     let searchQuery: String
 
     @State private var files: [CategoryFile] = []
-    @State private var fileToDelete: CategoryFile?
     @State private var selectedDimensionID: String?
     @State private var selectedFacetFilter: FacetFilterSelection?
     @State private var isCreatingDimension = false
@@ -84,7 +83,17 @@ struct CategoryView: View {
                             isFirst: file.id == visibleFiles.first?.id,
                             isLast: file.id == visibleFiles.last?.id
                         ) {
-                            fileToDelete = file
+                            withAnimation(.snappy) {
+                                model.deleteArchivedFile(
+                                    file.url,
+                                    category: category,
+                                    expectedSize: file.fileSize,
+                                    expectedModificationDate: file.modificationDate,
+                                    expectedResourceIdentifier: file.resourceIdentifier,
+                                    expectedPOSIXIdentity: file.posixIdentity,
+                                    expectedIsSymbolicLink: file.isSymbolicLink
+                                )
+                            }
                         }
                     }
                 }
@@ -113,26 +122,6 @@ struct CategoryView: View {
             NewFacetDimensionSheet(category: category)
                 .environment(model)
         }
-        .alert("将文件移到废纸篓？", isPresented: deleteAlertBinding) {
-            Button("取消", role: .cancel) { fileToDelete = nil }
-            Button("移到废纸篓", role: .destructive) {
-                if let fileToDelete {
-                    withAnimation(.snappy) {
-                        model.deleteArchivedFile(fileToDelete.url, category: category)
-                    }
-                }
-                fileToDelete = nil
-            }
-        } message: {
-            Text("“\(fileToDelete?.url.lastPathComponent ?? "这个文件")”会进入系统废纸篓。若它是微信等应用的引用，只会删除引用，不会影响原件。")
-        }
-    }
-
-    private var deleteAlertBinding: Binding<Bool> {
-        Binding(
-            get: { fileToDelete != nil },
-            set: { if !$0 { fileToDelete = nil } }
-        )
     }
 
     private var dimensions: [VirtualFacetDimension] {
@@ -329,7 +318,13 @@ struct CategoryView: View {
     private nonisolated static func loadFiles(at directory: URL) -> [CategoryFile] {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey],
+            includingPropertiesForKeys: [
+                .contentModificationDateKey,
+                .fileSizeKey,
+                .isDirectoryKey,
+                .isSymbolicLinkKey,
+                .fileResourceIdentifierKey
+            ],
             options: [.skipsHiddenFiles]
         )) ?? []
 
@@ -344,6 +339,9 @@ private struct CategoryFile: Identifiable, Sendable, Equatable {
     let modificationDate: Date?
     let fileSize: Int64
     let isDirectory: Bool
+    let isSymbolicLink: Bool
+    let resourceIdentifier: String?
+    let posixIdentity: POSIXFileIdentity?
     let fileSizeText: String?
     let modificationText: String?
 
@@ -354,11 +352,16 @@ private struct CategoryFile: Identifiable, Sendable, Equatable {
         let values = try? url.resourceValues(forKeys: [
             .contentModificationDateKey,
             .fileSizeKey,
-            .isDirectoryKey
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+            .fileResourceIdentifierKey
         ])
         modificationDate = values?.contentModificationDate
         fileSize = Int64(values?.fileSize ?? 0)
         isDirectory = values?.isDirectory ?? false
+        isSymbolicLink = values?.isSymbolicLink ?? false
+        resourceIdentifier = values?.fileResourceIdentifier.map { String(describing: $0) }
+        posixIdentity = isSymbolicLink ? nil : try? POSIXFileIdentity.captureRegularFile(at: url)
         fileSizeText = fileSize > 0 && !isDirectory
             ? ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
             : nil
@@ -413,6 +416,10 @@ private struct CategoryFileRow: View {
 
     private var showsSecondaryActions: Bool {
         isHovering || isPreviewSelected
+    }
+
+    private var deleteTitle: String {
+        file.isSymbolicLink ? "引用与原件移到废纸篓" : "移到废纸篓"
     }
 
     var body: some View {
@@ -476,7 +483,7 @@ private struct CategoryFileRow: View {
                 }
 
                 Divider()
-                Button("移到废纸篓", role: .destructive, action: onDelete)
+                Button(deleteTitle, role: .destructive, action: onDelete)
             }
             Divider()
             Button("复制路径") {
@@ -601,8 +608,10 @@ private struct CategoryFileRow: View {
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.borderless)
-                .help("移到废纸篓")
-                .accessibilityLabel("将 \(file.url.lastPathComponent) 移到废纸篓")
+                .help(deleteTitle)
+                .accessibilityLabel(file.isSymbolicLink
+                    ? "将 \(file.url.lastPathComponent) 的引用与 App 原件移到废纸篓"
+                    : "将 \(file.url.lastPathComponent) 移到废纸篓")
         } else if !file.isDirectory {
                 Menu {
                     Button("打开") { NSWorkspace.shared.open(file.url) }
@@ -624,7 +633,7 @@ private struct CategoryFileRow: View {
                         }
                     }
                     Divider()
-                    Button("移到废纸篓", role: .destructive, action: onDelete)
+                    Button(deleteTitle, role: .destructive, action: onDelete)
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.caption.weight(.semibold))

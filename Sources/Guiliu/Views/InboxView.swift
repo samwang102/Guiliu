@@ -4,7 +4,6 @@ import SwiftUI
 
 struct InboxView: View {
     @Environment(AppModel.self) private var model
-    @State private var itemToDelete: InboxItem?
     @State private var selectedItemID: UUID?
 
     var body: some View {
@@ -24,7 +23,9 @@ struct InboxView: View {
                                 InboxHeader()
 
                                 RoutingCard(item: item) {
-                                    itemToDelete = item
+                                    withAnimation(.snappy) {
+                                        model.delete(item)
+                                    }
                                 }
                                 .id(item.id)
                             }
@@ -44,17 +45,6 @@ struct InboxView: View {
         }
         .onChange(of: model.pendingItems.map(\.id)) { _, _ in
             selectFirstItemIfNeeded()
-        }
-        .alert("将文件移到废纸篓？", isPresented: deleteAlertBinding) {
-            Button("取消", role: .cancel) { itemToDelete = nil }
-            Button("移到废纸篓", role: .destructive) {
-                if let itemToDelete {
-                    withAnimation(.snappy) { model.delete(itemToDelete) }
-                }
-                itemToDelete = nil
-            }
-        } message: {
-            Text("“\(itemToDelete?.url.lastPathComponent ?? "这个文件")”会进入系统废纸篓，可以从归流的操作记录中恢复。")
         }
     }
 
@@ -125,12 +115,6 @@ struct InboxView: View {
         selectedItemID = model.pendingItems.first?.id
     }
 
-    private var deleteAlertBinding: Binding<Bool> {
-        Binding(
-            get: { itemToDelete != nil },
-            set: { if !$0 { itemToDelete = nil } }
-        )
-    }
 }
 
 private struct TriageQueueRow: View {
@@ -477,9 +461,13 @@ private struct RoutingCard: View {
                 Button("暂时忽略") {
                     withAnimation(.snappy) { model.ignore(item) }
                 }
-                if item.routingOperation == .move {
+                if item.routingOperation != .copy {
                     Divider()
-                    Button("移到废纸篓", role: .destructive, action: onDelete)
+                    Button(
+                        item.routingOperation == .reference ? "App 原件移到废纸篓" : "移到废纸篓",
+                        role: .destructive,
+                        action: onDelete
+                    )
                 }
             } label: {
                 Image(systemName: "ellipsis")

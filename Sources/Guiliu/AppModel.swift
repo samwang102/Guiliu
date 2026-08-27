@@ -4,6 +4,17 @@ import Foundation
 import GuiliuCore
 import Observation
 
+/// Foundation documents UserDefaults operations as thread-safe. This narrow
+/// wrapper makes that guarantee explicit to Swift 6 while exposing only the
+/// durability barrier needed by the transaction journal.
+private struct UserDefaultsDurabilityBarrier: @unchecked Sendable {
+    let defaults: UserDefaults
+
+    func synchronize() -> Bool {
+        defaults.synchronize()
+    }
+}
+
 struct AIAnalysisReaderRequest: Identifiable, Equatable {
     let fileURL: URL
     let category: FileCategory
@@ -71,6 +82,7 @@ final class AppModel {
     @ObservationIgnored private let originDetector = FileOriginDetector()
     @ObservationIgnored private let tagger = SmartTagger()
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let fileTransactionStore: FileTransactionStore
     @ObservationIgnored private var timer: AnyCancellable?
     @ObservationIgnored private var fileSystemMonitor: FileSystemEventMonitor?
     @ObservationIgnored private var knownPaths: Set<String> = []
@@ -136,7 +148,16 @@ final class AppModel {
 
     private struct ArchivedTrashResult: Sendable {
         let record: TrashRecord?
-        let trashedURL: URL
+        let metadataURL: URL
+        let affectedURLs: [URL]
+    }
+
+    private struct ArchivedReferenceDeletionAuthorization: Sendable {
+        let record: RoutingRecord
+        let location: MonitoredLocation
+        let sourceIdentity: FileIdentitySnapshot
+        let sourcePOSIXIdentity: POSIXFileIdentity
+        let referenceIdentity: SymbolicLinkIdentitySnapshot
     }
 
     private enum BackgroundResult<Value: Sendable>: Sendable {
@@ -171,6 +192,17 @@ final class AppModel {
         let defaultLibrary = homeDirectory
             .appendingPathComponent("Documents", isDirectory: true)
             .appendingPathComponent("归流文件库", isDirectory: true)
+        let applicationSupportDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? homeDirectory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+        fileTransactionStore = FileTransactionStore(
+            directory: applicationSupportDirectory
+                .appendingPathComponent("Guiliu", isDirectory: true)
+                .appendingPathComponent("FileTransactions", isDirectory: true)
+        )
 
         let environment = ProcessInfo.processInfo.environment
         let configuredDownloadPath = environment["GUILIU_MONITOR_PATH"]
@@ -197,6 +229,7 @@ final class AppModel {
         }
 
         loadPersistedData()
+        recoverInterruptedTrashTransactions()
         let missingPersistedPaths = Set(PendingFileReconciler.missingFileURLs(
             among: pendingItems.map(\.url),
             monitoredLocations: pendingFileReconciliationLocations
@@ -597,12 +630,15 @@ final class AppModel {
                     let origin = originDetector.detect(for: entry.url, fallback: entry.location.origin)
                     let suggestion = classifier.suggest(for: entry.url, customRules: customRulesSnapshot)
                     let capturedIdentity = try? FileIdentitySnapshot.capture(at: entry.url)
-                    let persistentIdentity = capturedIdentity?.matches(
+                    let identityMatches = capturedIdentity?.matches(
                         expectedSize: scanned.size,
                         expectedModificationDate: scanned.modificationDate,
                         expectedResourceIdentifier: scanned.resourceIdentifier,
                         expectedResourceIdentifierSession: FileIdentitySnapshot.currentResourceIdentifierSession
-                    ) == true ? capturedIdentity?.persistentIdentity : nil
+                    ) == true
+                    let persistentIdentity = identityMatches ? capturedIdentity?.persistentIdentity : nil
+                    let posixIdentity = identityMatches
+                        ? try? POSIXFileIdentity.captureRegularFile(at: entry.url) : nil
                     return ImportCandidate(
                         item: InboxItem(
                             url: entry.url,
@@ -617,7 +653,8 @@ final class AppModel {
                             resourceIdentifier: scanned.resourceIdentifier,
                             resourceIdentifierSession: scanned.resourceIdentifier == nil
                                 ? nil : FileIdentitySnapshot.currentResourceIdentifierSession,
-                            persistentIdentity: persistentIdentity
+                            persistentIdentity: persistentIdentity,
+                            posixIdentity: posixIdentity
                         ),
                         fingerprint: fingerprint
                     )
@@ -705,7 +742,12 @@ final class AppModel {
             quickArchivePanel.itemDidLeaveQueue(item.id)
             persistPendingItems()
             stability.removeValue(forKey: item.url.path)
-            knownPaths.insert(item.url.path)
+            switch effectiveOperation {
+            case .move:
+                knownPaths.remove(item.url.path)
+            case .copy, .reference:
+                knownPaths.insert(item.url.path)
+            }
             if let handledFingerprint {
                 handledFingerprints.insert(handledFingerprint)
                 persistHandledFingerprints()
@@ -793,7 +835,10 @@ final class AppModel {
 
     func delete(_ item: InboxItem) {
         guard processingItemIDs.insert(item.id).inserted else { return }
-        guard let location = monitoredLocations.first(where: { $0.id == item.sourceID }) else {
+        let deletionLocations = pendingFileReconciliationLocations
+        let exactLocation = deletionLocations.first(where: { $0.id == item.sourceID })
+        guard let location = exactLocation
+                ?? MonitoredLocation.preferred(for: item.url, among: deletionLocations) else {
             processingItemIDs.remove(item.id)
             errorMessage = "找不到这个文件原来的监控来源，归流不会冒险删除它。"
             return
@@ -801,10 +846,28 @@ final class AppModel {
 
         let handledFingerprint = fingerprint(for: item)
         let allowedRoot = location.url
+        let transactionStore = fileTransactionStore
+        let allowAppManagedOriginal = location.fileOwnership == .appManagedOriginal
+            && item.routingOperation == .reference
+        if item.routingOperation == .reference {
+            guard exactLocation != nil,
+                  allowAppManagedOriginal,
+                  location.contains(fileURL: item.url),
+                  item.posixIdentity != nil else {
+                processingItemIDs.remove(item.id)
+                errorMessage = "这个 App 原件缺少可验证的来源或文件身份，归流已取消删除。"
+                return
+            }
+        }
         Task { [weak self] in
             let result: BackgroundResult<TrashRecord> = await Task.detached(priority: .userInitiated) {
                 do {
-                    return .success(try TrashService().trash(item: item, allowedRoot: allowedRoot))
+                    return .success(try TrashService(transactionStore: transactionStore).trash(
+                        item: item,
+                        allowedRoot: allowedRoot,
+                        allowAppManagedOriginal: allowAppManagedOriginal,
+                        expectedPOSIXIdentity: item.posixIdentity
+                    ))
                 } catch {
                     return .failure(error.localizedDescription)
                 }
@@ -825,12 +888,14 @@ final class AppModel {
             quickArchivePanel.itemDidLeaveQueue(item.id)
             persistPendingItems()
             stability.removeValue(forKey: item.url.path)
-            knownPaths.insert(item.url.path)
+            knownPaths.remove(item.url.path)
             if let handledFingerprint {
                 handledFingerprints.insert(handledFingerprint)
                 persistHandledFingerprints()
             }
-            persistTrashHistory()
+            if persistTrashHistory() {
+                markTransactionHistoryApplied(record.transactionID)
+            }
             refreshSearchIndex(for: [
                 item.url,
                 URL(fileURLWithPath: record.trashedPath)
@@ -838,12 +903,63 @@ final class AppModel {
         }
     }
 
-    func deleteArchivedFile(_ source: URL, category: FileCategory) {
+    func deleteArchivedFile(
+        _ source: URL,
+        category: FileCategory,
+        expectedSize: Int64,
+        expectedModificationDate: Date?,
+        expectedResourceIdentifier: String?,
+        expectedPOSIXIdentity: POSIXFileIdentity?,
+        expectedIsSymbolicLink: Bool
+    ) {
         let sourcePath = source.standardizedFileURL.path
         guard processingLibraryPaths.insert(sourcePath).inserted else { return }
         let categoryDirectory = libraryURL
             .appendingPathComponent(category.displayName, isDirectory: true)
             .standardizedFileURL
+        let transactionStore = fileTransactionStore
+        let deletionLocations = pendingFileReconciliationLocations
+        let referenceAuthorization: ArchivedReferenceDeletionAuthorization?
+        if expectedIsSymbolicLink {
+            let trashedRoutingRecordIDs = Set(trashHistory.compactMap { record in
+                record.isRestored ? nil : record.routingRecordID
+            })
+            let matchingRecords = history.filter {
+                !$0.isRestored
+                    && $0.effectiveOperation == .reference
+                    && !trashedRoutingRecordIDs.contains($0.id)
+                    && URL(fileURLWithPath: $0.destinationPath).standardizedFileURL.path == sourcePath
+            }
+            guard matchingRecords.count == 1,
+                  let record = matchingRecords.first,
+                  let sourceID = record.sourceID,
+                  !sourceID.isEmpty,
+                  let sourceIdentity = record.sourceIdentity,
+                  let sourcePOSIXIdentity = record.sourcePOSIXIdentity,
+                  let referenceIdentity = record.referenceIdentity else {
+                processingLibraryPaths.remove(sourcePath)
+                errorMessage = "这个引用缺少可验证的归档身份。为避免误删 App 原件，请先撤销后重新归档，再执行删除。"
+                return
+            }
+            let originalURL = URL(fileURLWithPath: record.originalPath).standardizedFileURL
+            guard referenceIdentity.destinationPath == originalURL.path,
+                  let location = deletionLocations.first(where: { $0.id == sourceID }),
+                  location.fileOwnership == .appManagedOriginal,
+                  location.contains(fileURL: originalURL) else {
+                processingLibraryPaths.remove(sourcePath)
+                errorMessage = "引用的来源记录与当前 App 文件目录不一致，归流已取消删除。"
+                return
+            }
+            referenceAuthorization = ArchivedReferenceDeletionAuthorization(
+                record: record,
+                location: location,
+                sourceIdentity: sourceIdentity,
+                sourcePOSIXIdentity: sourcePOSIXIdentity,
+                referenceIdentity: referenceIdentity
+            )
+        } else {
+            referenceAuthorization = nil
+        }
 
         Task { [weak self] in
             let result: BackgroundResult<ArchivedTrashResult> = await Task.detached(priority: .userInitiated) {
@@ -860,26 +976,75 @@ final class AppModel {
                         .contentModificationDateKey,
                         .fileResourceIdentifierKey
                     ])
-
-                    // App-managed documents are represented by symbolic links in
-                    // the library. Trashing that link removes only the reference;
-                    // the WeChat/QQ/Feishu original is deliberately untouched.
+                    guard values.isSymbolicLink == expectedIsSymbolicLink else {
+                        throw TrashError.fileChanged
+                    }
                     if values.isSymbolicLink == true {
-                        var resultingURL: NSURL?
-                        try FileManager.default.trashItem(at: freshURL, resultingItemURL: &resultingURL)
-                        guard let resultingURL else { throw TrashError.trashedFileMissing }
+                        guard let authorization = referenceAuthorization,
+                              authorization.record.destinationPath == sourcePath else {
+                            throw TrashError.fileChanged
+                        }
+                        let originalURL = URL(
+                            fileURLWithPath: authorization.record.originalPath
+                        ).standardizedFileURL
+                        let originalItem = InboxItem(
+                            url: originalURL,
+                            fileSize: authorization.sourceIdentity.size,
+                            suggestion: ClassificationSuggestion(
+                                category: category,
+                                reason: "已归档的 App 文件",
+                                confidence: 1
+                            ),
+                            origin: authorization.record.effectiveOrigin,
+                            routingOperation: .reference,
+                            sourceID: authorization.location.id,
+                            sourceDisplayName: authorization.location.displayName,
+                            modificationDate: authorization.sourceIdentity.modificationDate,
+                            // fileResourceIdentifier is process-scoped. The
+                            // persisted POSIX identity below remains valid across
+                            // relaunches and is the authoritative path-reuse guard.
+                            resourceIdentifier: nil,
+                            resourceIdentifierSession: nil,
+                            persistentIdentity: authorization.sourceIdentity.persistentIdentity
+                        )
+                        let trashed = try TrashService(
+                            transactionStore: transactionStore
+                        ).trashReferenceAndOriginal(
+                            referenceURL: freshURL,
+                            referenceRoot: categoryDirectory,
+                            expectedReferenceIdentity: authorization.referenceIdentity,
+                            originalItem: originalItem,
+                            originalRoot: authorization.location.url,
+                            expectedOriginalPOSIXIdentity: authorization.sourcePOSIXIdentity,
+                            routingRecordID: authorization.record.id
+                        )
                         return .success(ArchivedTrashResult(
-                            record: nil,
-                            trashedURL: resultingURL as URL
+                            record: trashed.record,
+                            metadataURL: trashed.trashedReferenceURL,
+                            affectedURLs: [
+                                freshURL,
+                                trashed.trashedReferenceURL,
+                                originalURL,
+                                URL(fileURLWithPath: trashed.record.trashedPath)
+                            ]
                         ))
                     }
 
-                    guard values.isRegularFile == true, let fileSize = values.fileSize else {
+                    guard values.isRegularFile == true else {
                         throw TrashError.unsupportedItem
+                    }
+                    guard let expectedPOSIXIdentity,
+                          try POSIXFileIdentity.captureRegularFile(at: freshURL)
+                            == expectedPOSIXIdentity else {
+                        throw TrashError.fileChanged
+                    }
+                    if let expectedResourceIdentifier,
+                       values.fileResourceIdentifier.map({ String(describing: $0) }) != expectedResourceIdentifier {
+                        throw TrashError.fileChanged
                     }
                     let item = InboxItem(
                         url: freshURL,
-                        fileSize: Int64(fileSize),
+                        fileSize: expectedSize,
                         suggestion: ClassificationSuggestion(
                             category: category,
                             reason: "已归档文件",
@@ -889,13 +1054,18 @@ final class AppModel {
                         routingOperation: .move,
                         sourceID: "library:\(category.rawValue)",
                         sourceDisplayName: "归流文件库",
-                        modificationDate: values.contentModificationDate,
-                        resourceIdentifier: values.fileResourceIdentifier.map { String(describing: $0) }
+                        modificationDate: expectedModificationDate,
+                        resourceIdentifier: expectedResourceIdentifier
                     )
-                    let record = try TrashService().trash(item: item, allowedRoot: categoryDirectory)
+                    let record = try TrashService(transactionStore: transactionStore).trash(
+                        item: item,
+                        allowedRoot: categoryDirectory,
+                        expectedPOSIXIdentity: expectedPOSIXIdentity
+                    )
                     return .success(ArchivedTrashResult(
                         record: record,
-                        trashedURL: URL(fileURLWithPath: record.trashedPath)
+                        metadataURL: URL(fileURLWithPath: record.trashedPath),
+                        affectedURLs: [freshURL, URL(fileURLWithPath: record.trashedPath)]
                     ))
                 } catch {
                     return .failure(error.localizedDescription)
@@ -910,14 +1080,16 @@ final class AppModel {
 
             if let record = trashed.record {
                 trashHistory.insert(record, at: 0)
-                persistTrashHistory()
+                if persistTrashHistory() {
+                    markTransactionHistoryApplied(record.transactionID)
+                }
             }
             if filePreviewURL?.standardizedFileURL.path == sourcePath {
                 filePreviewURL = nil
             }
-            relocateDocumentMetadata(from: source, to: trashed.trashedURL)
+            relocateDocumentMetadata(from: source, to: trashed.metadataURL)
             refreshCategoryCounts()
-            refreshSearchIndex(for: [source, trashed.trashedURL])
+            refreshSearchIndex(for: trashed.affectedURLs)
         }
     }
 
@@ -964,10 +1136,13 @@ final class AppModel {
 
     func restoreDeleted(_ record: TrashRecord) {
         guard processingHistoryIDs.insert(record.id).inserted else { return }
+        let transactionStore = fileTransactionStore
         Task { [weak self] in
             let result: BackgroundResult<TrashRecord> = await Task.detached(priority: .userInitiated) {
                 do {
-                    return .success(try TrashService().restore(record))
+                    return .success(try TrashService(
+                        transactionStore: transactionStore
+                    ).restore(record))
                 } catch {
                     return .failure(error.localizedDescription)
                 }
@@ -982,21 +1157,38 @@ final class AppModel {
             if let index = trashHistory.firstIndex(where: { $0.id == record.id }) {
                 trashHistory[index] = updated
             }
-            relocateDocumentMetadata(
-                from: URL(fileURLWithPath: record.trashedPath),
-                to: URL(fileURLWithPath: updated.trashedPath)
+            let metadataSource = URL(
+                fileURLWithPath: record.trashedReferencePath ?? record.trashedPath
             )
-            requeueRestoredFile(
-                at: URL(fileURLWithPath: updated.trashedPath),
-                preferredSourceID: record.sourceID,
-                previousPath: record.originalPath
+            let metadataDestination = URL(
+                fileURLWithPath: updated.restoredReferencePath ?? updated.trashedPath
             )
-            persistTrashHistory()
+            relocateDocumentMetadata(from: metadataSource, to: metadataDestination)
+            let includesArchivedReference = record.includesArchivedReference
+                || updated.includesArchivedReference
+            let restoredReferenceRoutingRecord = updateRoutingRecordAfterPairedRestore(updated)
+            if !includesArchivedReference {
+                requeueRestoredFile(
+                    at: URL(fileURLWithPath: updated.trashedPath),
+                    preferredSourceID: record.sourceID,
+                    previousPath: record.originalPath
+                )
+            }
+            let didPersistTrashHistory = persistTrashHistory()
+            let didPersistRoutingHistory = !restoredReferenceRoutingRecord || persistHistory()
+            if didPersistTrashHistory, didPersistRoutingHistory {
+                markTransactionHistoryApplied(updated.transactionID)
+            }
             refreshCategoryCounts()
-            refreshSearchIndex(for: [
+            var affectedURLs = [
                 URL(fileURLWithPath: record.trashedPath),
                 URL(fileURLWithPath: updated.trashedPath)
-            ])
+            ]
+            affectedURLs.append(contentsOf: [
+                record.trashedReferencePath,
+                updated.restoredReferencePath
+            ].compactMap { $0.map(URL.init(fileURLWithPath:)) })
+            refreshSearchIndex(for: affectedURLs)
         }
     }
 
@@ -1869,6 +2061,7 @@ final class AppModel {
                 resourceIdentifier: item.resourceIdentifier,
                 resourceIdentifierSession: item.resourceIdentifierSession,
                 persistentIdentity: item.persistentIdentity,
+                posixIdentity: item.posixIdentity,
                 aiSummary: item.aiSummary,
                 aiModel: item.aiModel,
                 aiAnalyzedAt: item.aiAnalyzedAt
@@ -2365,12 +2558,15 @@ final class AppModel {
         let resourceIdentifier = capturedResourceIdentifier
             ?? resourceValues?.fileResourceIdentifier.map { String(describing: $0) }
         let capturedIdentity = try? FileIdentitySnapshot.capture(at: entry.url)
-        let persistentIdentity = capturedIdentity?.matches(
+        let identityMatches = capturedIdentity?.matches(
             expectedSize: size,
             expectedModificationDate: modificationDate,
             expectedResourceIdentifier: resourceIdentifier,
             expectedResourceIdentifierSession: FileIdentitySnapshot.currentResourceIdentifierSession
-        ) == true ? capturedIdentity?.persistentIdentity : nil
+        ) == true
+        let persistentIdentity = identityMatches ? capturedIdentity?.persistentIdentity : nil
+        let posixIdentity = identityMatches
+            ? try? POSIXFileIdentity.captureRegularFile(at: entry.url) : nil
         return InboxItem(
             url: entry.url,
             fileSize: size,
@@ -2384,7 +2580,8 @@ final class AppModel {
             resourceIdentifier: resourceIdentifier,
             resourceIdentifierSession: resourceIdentifier == nil
                 ? nil : FileIdentitySnapshot.currentResourceIdentifierSession,
-            persistentIdentity: persistentIdentity
+            persistentIdentity: persistentIdentity,
+            posixIdentity: posixIdentity
         )
     }
 
@@ -2669,6 +2866,173 @@ final class AppModel {
         }))
     }
 
+    /// Reconciles durable file-system transactions before any monitor or scan
+    /// can observe their intermediate paths. Completed operations are replayed
+    /// into UserDefaults idempotently; partial operations have already been
+    /// rolled back by TrashService.
+    private func recoverInterruptedTrashTransactions() {
+        let recovery: TrashTransactionRecoveryResult
+        do {
+            recovery = try TrashService(
+                transactionStore: fileTransactionStore
+            ).recoverInterruptedTransactions()
+        } catch {
+            errorMessage = "文件操作恢复检查失败：\(error.localizedDescription)"
+            return
+        }
+
+        var didChangeTrashHistory = false
+        var didChangeRoutingHistory = false
+        var didChangePendingItems = false
+        var completedTransactionIDs: [UUID] = []
+
+        for transaction in recovery.completedTransactions {
+            guard let recoveredRecord = transaction.trashRecord else { continue }
+            completedTransactionIDs.append(transaction.id)
+
+            switch transaction.operation {
+            case .deleteSingle, .deleteReferencePair:
+                didChangeTrashHistory = mergeRecoveredTrashRecord(recoveredRecord)
+                    || didChangeTrashHistory
+
+                let originalPath = URL(fileURLWithPath: recoveredRecord.originalPath)
+                    .standardizedFileURL.path
+                knownPaths.remove(originalPath)
+                let previousPendingCount = pendingItems.count
+                pendingItems.removeAll {
+                    $0.url.standardizedFileURL.path == originalPath
+                        && $0.posixIdentity == transaction.expectedOriginalIdentity
+                }
+                didChangePendingItems = pendingItems.count != previousPendingCount
+                    || didChangePendingItems
+
+                let metadataSource = URL(fileURLWithPath:
+                    recoveredRecord.originalReferencePath ?? recoveredRecord.originalPath
+                )
+                let metadataDestination = URL(fileURLWithPath:
+                    recoveredRecord.trashedReferencePath ?? recoveredRecord.trashedPath
+                )
+                relocateDocumentMetadata(from: metadataSource, to: metadataDestination)
+
+            case .restoreSingle, .restoreReferencePair:
+                let previousRecord = trashHistory.first { $0.id == recoveredRecord.id }
+                didChangeTrashHistory = mergeRecoveredTrashRecord(recoveredRecord)
+                    || didChangeTrashHistory
+
+                let metadataSourcePath = transaction.actualReferenceTrashPath
+                    ?? transaction.actualOriginalTrashPath
+                    ?? previousRecord?.trashedReferencePath
+                    ?? previousRecord?.trashedPath
+                let metadataDestinationPath = recoveredRecord.restoredReferencePath
+                    ?? recoveredRecord.trashedPath
+                if let metadataSourcePath {
+                    relocateDocumentMetadata(
+                        from: URL(fileURLWithPath: metadataSourcePath),
+                        to: URL(fileURLWithPath: metadataDestinationPath)
+                    )
+                }
+
+                if transaction.operation == .restoreReferencePair
+                    || recoveredRecord.includesArchivedReference {
+                    didChangeRoutingHistory = updateRoutingRecordAfterPairedRestore(
+                        recoveredRecord
+                    ) || didChangeRoutingHistory
+                } else {
+                    requeueRestoredFile(
+                        at: URL(fileURLWithPath: recoveredRecord.trashedPath),
+                        preferredSourceID: recoveredRecord.sourceID,
+                        previousPath: recoveredRecord.originalPath
+                    )
+                }
+            }
+        }
+
+        if trashHistory.count > 200 {
+            // Recovery can replay old and new journals together. Sort by the
+            // durable deletion timestamp before enforcing the hard cap so an
+            // old replay cannot displace a genuinely recent entry.
+            trashHistory = Array(trashHistory.sorted {
+                if $0.trashedAt != $1.trashedAt {
+                    return $0.trashedAt > $1.trashedAt
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }.prefix(200))
+            didChangeTrashHistory = true
+        }
+        if didChangePendingItems {
+            persistPendingItems()
+        }
+        let didPersistTrashHistory = !didChangeTrashHistory || persistTrashHistory()
+        let didPersistRoutingHistory = !didChangeRoutingHistory || persistHistory()
+        if didPersistTrashHistory, didPersistRoutingHistory {
+            for transactionID in completedTransactionIDs {
+                markTransactionHistoryApplied(transactionID)
+            }
+        }
+
+        var warnings = recovery.attentionMessages
+        if !recovery.loadIssues.isEmpty,
+           !warnings.contains(where: { $0.hasPrefix("文件操作日志无法读取：") }) {
+            warnings.append("有 \(recovery.loadIssues.count) 条文件操作记录无法读取，已隔离并停止自动处理。")
+        }
+        if !warnings.isEmpty {
+            errorMessage = (["检测到需要人工核对的文件操作："] + warnings)
+                .joined(separator: "\n")
+        }
+    }
+
+    @discardableResult
+    private func mergeRecoveredTrashRecord(_ recoveredRecord: TrashRecord) -> Bool {
+        if let index = trashHistory.firstIndex(where: { $0.id == recoveredRecord.id }) {
+            guard trashHistory[index] != recoveredRecord else { return false }
+            trashHistory[index] = recoveredRecord
+        } else {
+            trashHistory.insert(recoveredRecord, at: 0)
+        }
+        return true
+    }
+
+    /// Updates the reference-routing audit record after its original and link
+    /// have been restored. A pair is never requeued as a new inbox file.
+    @discardableResult
+    private func updateRoutingRecordAfterPairedRestore(_ record: TrashRecord) -> Bool {
+        guard record.includesArchivedReference,
+              let routingRecordID = record.routingRecordID,
+              let restoredReferencePath = record.restoredReferencePath,
+              let historyIndex = history.firstIndex(where: { $0.id == routingRecordID }) else {
+            return false
+        }
+
+        let restoredOriginalURL = URL(fileURLWithPath: record.trashedPath).standardizedFileURL
+        let restoredReferenceURL = URL(fileURLWithPath: restoredReferencePath).standardizedFileURL
+        history[historyIndex].originalPath = restoredOriginalURL.path
+        history[historyIndex].destinationPath = restoredReferenceURL.path
+        history[historyIndex].sourceIdentity = try? FileIdentitySnapshot.capture(
+            at: restoredOriginalURL
+        )
+        history[historyIndex].sourcePOSIXIdentity = try? POSIXFileIdentity.captureRegularFile(
+            at: restoredOriginalURL
+        )
+        history[historyIndex].referenceIdentity = try? SymbolicLinkIdentitySnapshot.capture(
+            at: restoredReferenceURL
+        )
+        return true
+    }
+
+    private func markTransactionHistoryApplied(_ transactionID: UUID?) {
+        guard let transactionID else { return }
+        // The journal is deliberately marked only after the corresponding
+        // UserDefaults suite has synchronously flushed its pending writes. If
+        // flushing fails, leaving the journal at fileSystemCompleted makes the
+        // next launch replay it safely.
+        let transactionStore = fileTransactionStore
+        let durabilityBarrier = UserDefaultsDurabilityBarrier(defaults: defaults)
+        Task.detached(priority: .utility) {
+            guard durabilityBarrier.synchronize() else { return }
+            _ = try? transactionStore.markHistoryApplied(id: transactionID)
+        }
+    }
+
 
     private func loadPersistedData() {
         let decoder = JSONDecoder()
@@ -2714,19 +3078,46 @@ final class AppModel {
         var didChange = false
         for index in pendingItems.indices {
             let item = pendingItems[index]
-            guard item.resourceIdentifierSession != FileIdentitySnapshot.currentResourceIdentifierSession,
-                  let current = try? FileIdentitySnapshot.capture(at: item.url) else { continue }
+            guard item.resourceIdentifierSession
+                    != FileIdentitySnapshot.currentResourceIdentifierSession else { continue }
+
+            guard let expectedPersistentIdentity = item.persistentIdentity else {
+                // A legacy record without durable identity evidence must never
+                // gain a fresh POSIX authorization merely because a new file at
+                // the same path happens to share its size and timestamp.
+                if item.posixIdentity != nil {
+                    let savedIdentity = FileIdentitySnapshot(
+                        size: item.fileSize,
+                        modificationDate: item.modificationDate,
+                        resourceIdentifier: item.resourceIdentifier,
+                        resourceIdentifierSession: item.resourceIdentifierSession,
+                        persistentIdentity: nil
+                    )
+                    pendingItems[index] = item.replacingFileIdentity(
+                        with: savedIdentity,
+                        posixIdentity: nil
+                    )
+                    didChange = true
+                }
+                continue
+            }
+
+            guard let current = try? FileIdentitySnapshot.capture(at: item.url),
+                  current.persistentIdentity == expectedPersistentIdentity else { continue }
 
             let matchesSavedEvidence = current.matches(
                 expectedSize: item.fileSize,
                 expectedModificationDate: item.modificationDate,
                 expectedResourceIdentifier: item.resourceIdentifier,
                 expectedResourceIdentifierSession: item.resourceIdentifierSession,
-                expectedPersistentIdentity: item.persistentIdentity
+                expectedPersistentIdentity: expectedPersistentIdentity
             )
             guard matchesSavedEvidence else { continue }
 
-            pendingItems[index] = item.replacingFileIdentity(with: current)
+            pendingItems[index] = item.replacingFileIdentity(
+                with: current,
+                posixIdentity: try? POSIXFileIdentity.captureRegularFile(at: item.url)
+            )
             didChange = true
         }
         if didChange {
@@ -2734,10 +3125,13 @@ final class AppModel {
         }
     }
 
-    private func persistHistory() {
-        if let data = try? JSONEncoder().encode(Array(history.prefix(500))) {
-            defaults.set(data, forKey: DefaultsKey.history)
+    @discardableResult
+    private func persistHistory() -> Bool {
+        guard let data = try? JSONEncoder().encode(Array(history.prefix(500))) else {
+            return false
         }
+        defaults.set(data, forKey: DefaultsKey.history)
+        return true
     }
 
     private func persistCustomRules() {
@@ -2750,10 +3144,13 @@ final class AppModel {
         defaults.set(Array(handledFingerprints.suffix(10_000)), forKey: DefaultsKey.handledFingerprints)
     }
 
-    private func persistTrashHistory() {
-        if let data = try? JSONEncoder().encode(Array(trashHistory.prefix(200))) {
-            defaults.set(data, forKey: DefaultsKey.trashHistory)
+    @discardableResult
+    private func persistTrashHistory() -> Bool {
+        guard let data = try? JSONEncoder().encode(Array(trashHistory.prefix(200))) else {
+            return false
         }
+        defaults.set(data, forKey: DefaultsKey.trashHistory)
+        return true
     }
 
     private func persistPendingItems() {

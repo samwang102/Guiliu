@@ -139,6 +139,7 @@ struct RoutingServiceTests {
         #expect(decoded.resourceIdentifier == "sample-volatile-id")
         #expect(decoded.resourceIdentifierSession == nil)
         #expect(decoded.persistentIdentity == nil)
+        #expect(decoded.posixIdentity == nil)
     }
 
     @Test("入队后大小变化时复制归档失败且保留原文件")
@@ -423,11 +424,16 @@ struct RoutingServiceTests {
             to: .researchPapers,
             libraryRoot: fixture.library,
             operation: .reference,
-            origin: .wechat
+            origin: .wechat,
+            sourceID: "app-attachment-root"
         )
         let reference = URL(fileURLWithPath: record.destinationPath)
 
         #expect(record.effectiveOperation == .reference)
+        #expect(record.sourceID == "app-attachment-root")
+        #expect(record.sourceIdentity != nil)
+        #expect(record.sourcePOSIXIdentity != nil)
+        #expect(record.referenceIdentity != nil)
         #expect(FileManager.default.fileExists(atPath: source.path))
         #expect(try FileManager.default.destinationOfSymbolicLink(atPath: reference.path) == source.path)
         #expect((try reference.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink == true)
@@ -543,6 +549,10 @@ struct RoutingServiceTests {
         #expect(decoded.sourceFileSize == nil)
         #expect(decoded.tags == nil)
         #expect(decoded.sourceContentHash == nil)
+        #expect(decoded.sourceID == nil)
+        #expect(decoded.sourceIdentity == nil)
+        #expect(decoded.sourcePOSIXIdentity == nil)
+        #expect(decoded.referenceIdentity == nil)
         #expect(decoded.effectiveOperation == .move)
         #expect(decoded.effectiveOrigin == .unknown)
     }

@@ -26,6 +26,7 @@ struct HistoryView: View {
                             ForEach(model.history) { record in
                                 HistoryRow(
                                     record: record,
+                                    isInTrash: trashedRoutingRecordIDs.contains(record.id),
                                     isFirst: record.id == model.history.first?.id,
                                     isLast: record.id == model.history.last?.id
                                 )
@@ -80,10 +81,22 @@ struct HistoryView: View {
 
     private var metrics: some View {
         HStack(spacing: 18) {
-            HistoryMetric(value: model.history.filter { !$0.isRestored }.count, label: "现有归档", tint: GuiliuTheme.brand)
+            HistoryMetric(
+                value: model.history.filter {
+                    !$0.isRestored && !trashedRoutingRecordIDs.contains($0.id)
+                }.count,
+                label: "现有归档",
+                tint: GuiliuTheme.brand
+            )
             Divider().frame(height: 34)
             HistoryMetric(value: model.trashHistory.filter { !$0.isRestored }.count, label: "废纸篓", tint: .red)
         }
+    }
+
+    private var trashedRoutingRecordIDs: Set<UUID> {
+        Set(model.trashHistory.compactMap { record in
+            record.isRestored ? nil : record.routingRecordID
+        })
     }
 }
 
@@ -125,7 +138,7 @@ private struct TrashHistoryRow: View {
                     .font(.body.weight(.semibold))
                     .lineLimit(1)
                 Label(
-                    record.isRestored ? "已从废纸篓恢复" : "已移到废纸篓",
+                    trashStatusTitle,
                     systemImage: record.isRestored ? "checkmark" : "clock"
                 )
                 .font(.caption)
@@ -146,7 +159,7 @@ private struct TrashHistoryRow: View {
                         .controlSize(.small)
                         .accessibilityLabel("正在恢复")
                 } else {
-                    Button("恢复") {
+                    Button(record.includesArchivedReference ? "一起恢复" : "恢复") {
                         model.restoreDeleted(record)
                     }
                     .buttonStyle(.bordered)
@@ -155,21 +168,31 @@ private struct TrashHistoryRow: View {
             }
         }
     }
+
+    private var trashStatusTitle: String {
+        if record.includesArchivedReference {
+            return record.isRestored ? "引用与原件已恢复" : "引用与原件已移到废纸篓"
+        }
+        return record.isRestored ? "已从废纸篓恢复" : "已移到废纸篓"
+    }
 }
 
 private struct HistoryRow: View {
     @Environment(AppModel.self) private var model
     let record: RoutingRecord
+    let isInTrash: Bool
     let isFirst: Bool
     let isLast: Bool
 
     var body: some View {
         historyShell(
-            tint: record.isRestored ? .secondary : record.category.tint,
+            tint: record.isRestored || isInTrash ? .secondary : record.category.tint,
             isFirst: isFirst,
             isLast: isLast
         ) {
-            Image(systemName: record.isRestored ? "arrow.uturn.backward.circle.fill" : record.category.symbolName)
+            Image(systemName: record.isRestored
+                ? "arrow.uturn.backward.circle.fill"
+                : (isInTrash ? "trash.fill" : record.category.symbolName))
                 .font(.system(size: 18, weight: .semibold))
         } content: {
             VStack(alignment: .leading, spacing: 4) {
@@ -177,7 +200,11 @@ private struct HistoryRow: View {
                     .font(.body.weight(.semibold))
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    Text(record.isRestored ? "已撤销" : "\(record.effectiveOperation.actionName)至 \(record.category.displayName)")
+                    Text(record.isRestored
+                        ? "已撤销"
+                        : (isInTrash
+                            ? "已随原件移到废纸篓"
+                            : "\(record.effectiveOperation.actionName)至 \(record.category.displayName)"))
                     if record.effectiveOrigin != .unknown {
                         Text("·")
                         Text(record.effectiveOrigin.displayName)
@@ -191,12 +218,14 @@ private struct HistoryRow: View {
             }
         } trailing: {
             HStack(spacing: 8) {
-                Button("显示") {
-                    model.reveal(url: URL(fileURLWithPath: record.destinationPath))
+                if !isInTrash {
+                    Button("显示") {
+                        model.reveal(url: URL(fileURLWithPath: record.destinationPath))
+                    }
+                    .buttonStyle(.borderless)
                 }
-                .buttonStyle(.borderless)
 
-                if !record.isRestored {
+                if !record.isRestored && !isInTrash {
                     if model.processingHistoryIDs.contains(record.id) {
                         ProgressView()
                             .controlSize(.small)
@@ -207,6 +236,10 @@ private struct HistoryRow: View {
                         }
                         .buttonStyle(.bordered)
                     }
+                } else if isInTrash {
+                    Text("请从废纸篓记录恢复")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }

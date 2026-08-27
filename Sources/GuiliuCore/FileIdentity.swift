@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// File-system identity that Foundation documents as persistent across system
@@ -34,7 +35,7 @@ public struct PersistentFileIdentity: Codable, Equatable, Hashable, Sendable {
 /// A lightweight identity snapshot captured when a regular file enters the
 /// inbox. It deliberately excludes directories, packages and symbolic links so
 /// callers cannot accidentally turn a monitored folder into a routing target.
-public struct FileIdentitySnapshot: Equatable, Sendable {
+public struct FileIdentitySnapshot: Codable, Equatable, Hashable, Sendable {
     public let size: Int64
     public let modificationDate: Date?
     public let resourceIdentifier: String?
@@ -145,7 +146,84 @@ public struct FileIdentitySnapshot: Equatable, Sendable {
     }
 }
 
+/// A no-follow identity for an ordinary file. Device and inode are captured
+/// with `lstat`, so replacing a path with another file cannot reuse the
+/// authorization granted to the original object.
+public struct POSIXFileIdentity: Codable, Equatable, Hashable, Sendable {
+    public let device: UInt64
+    public let inode: UInt64
+
+    public init(device: UInt64, inode: UInt64) {
+        self.device = device
+        self.inode = inode
+    }
+
+    public static func captureRegularFile(at url: URL) throws -> POSIXFileIdentity {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else { throw FileIdentityError.missing }
+        guard status.st_mode & S_IFMT == S_IFREG else { throw FileIdentityError.unsupportedItem }
+        return POSIXFileIdentity(
+            device: UInt64(truncatingIfNeeded: status.st_dev),
+            inode: UInt64(truncatingIfNeeded: status.st_ino)
+        )
+    }
+}
+
+/// Identity and immutable target text for a library reference. Only absolute,
+/// normalized links whose final target is an ordinary file are accepted.
+public struct SymbolicLinkIdentitySnapshot: Codable, Equatable, Hashable, Sendable {
+    public let device: UInt64
+    public let inode: UInt64
+    public let destinationPath: String
+
+    public init(device: UInt64, inode: UInt64, destinationPath: String) {
+        self.device = device
+        self.inode = inode
+        self.destinationPath = destinationPath
+    }
+
+    public static func capture(
+        at url: URL,
+        requireRegularFileTarget: Bool = true
+    ) throws -> SymbolicLinkIdentitySnapshot {
+        var linkStatus = stat()
+        guard lstat(url.path, &linkStatus) == 0 else { throw SymbolicLinkIdentityError.missing }
+        guard linkStatus.st_mode & S_IFMT == S_IFLNK else {
+            throw SymbolicLinkIdentityError.notSymbolicLink
+        }
+
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
+        guard destination.hasPrefix("/"),
+              URL(fileURLWithPath: destination).standardizedFileURL.path == destination else {
+            throw SymbolicLinkIdentityError.unsafeDestination
+        }
+
+        if requireRegularFileTarget {
+            var targetStatus = stat()
+            guard lstat(destination, &targetStatus) == 0 else {
+                throw SymbolicLinkIdentityError.missingTarget
+            }
+            guard targetStatus.st_mode & S_IFMT == S_IFREG else {
+                throw SymbolicLinkIdentityError.unsafeDestination
+            }
+        }
+
+        return SymbolicLinkIdentitySnapshot(
+            device: UInt64(truncatingIfNeeded: linkStatus.st_dev),
+            inode: UInt64(truncatingIfNeeded: linkStatus.st_ino),
+            destinationPath: destination
+        )
+    }
+}
+
 public enum FileIdentityError: Error, Equatable, Sendable {
     case missing
     case unsupportedItem
+}
+
+public enum SymbolicLinkIdentityError: Error, Equatable, Sendable {
+    case missing
+    case notSymbolicLink
+    case missingTarget
+    case unsafeDestination
 }
