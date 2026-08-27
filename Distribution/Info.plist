@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>归流</string>
+    <key>CFBundleExecutable</key>
+    <string>Guiliu</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.guiliu.desktop</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>归流</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+    <key>CFBundleVersion</key>
+	<string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppDataUsageDescription</key>
+    <string>仅在你从设置中主动开启微信内部附件监控时，读取微信接收文件目录并创建不复制原件的引用。</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>归流需要监控桌面中新保存的截图和文件，以便及时提供归档或移到废纸篓操作。</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>
