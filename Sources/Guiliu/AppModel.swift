@@ -833,14 +833,26 @@ final class AppModel {
         }
     }
 
-    func delete(_ item: InboxItem) {
-        guard processingItemIDs.insert(item.id).inserted else { return }
+    func delete(_ requestedItem: InboxItem, completion: ((String?) -> Void)? = nil) {
+        func reportFailure(_ message: String) {
+            if let completion { completion(message) }
+            else { errorMessage = message }
+        }
+        guard let currentItem = pendingItems.first(where: { $0.id == requestedItem.id }) else {
+            reportFailure("文件已离开待归档队列，请刷新后重试。")
+            return
+        }
+        let item = currentItem.replacingRoutingOperation(routingPolicy(for: currentItem).operation)
+        guard processingItemIDs.insert(item.id).inserted else {
+            reportFailure("这个文件正在处理，请稍候。")
+            return
+        }
         let deletionLocations = pendingFileReconciliationLocations
         let exactLocation = deletionLocations.first(where: { $0.id == item.sourceID })
         guard let location = exactLocation
                 ?? MonitoredLocation.preferred(for: item.url, among: deletionLocations) else {
             processingItemIDs.remove(item.id)
-            errorMessage = "找不到这个文件原来的监控来源，归流不会冒险删除它。"
+            reportFailure("找不到这个文件原来的监控来源，归流不会冒险删除它。")
             return
         }
 
@@ -855,7 +867,7 @@ final class AppModel {
                   location.contains(fileURL: item.url),
                   item.posixIdentity != nil else {
                 processingItemIDs.remove(item.id)
-                errorMessage = "这个 App 原件缺少可验证的来源或文件身份，归流已取消删除。"
+                reportFailure("这个 App 原件缺少可验证的来源或文件身份，归流已取消删除。")
                 return
             }
         }
@@ -875,7 +887,7 @@ final class AppModel {
             guard let self else { return }
             processingItemIDs.remove(item.id)
             guard case let .success(record) = result else {
-                if case let .failure(message) = result { errorMessage = message }
+                if case let .failure(message) = result { reportFailure(message) }
                 return
             }
 
@@ -900,6 +912,7 @@ final class AppModel {
                 item.url,
                 URL(fileURLWithPath: record.trashedPath)
             ])
+            completion?(nil)
         }
     }
 
@@ -1261,7 +1274,7 @@ final class AppModel {
         filePreviewURL = nil
     }
 
-    func previewOrOpen(_ url: URL) {
+    func previewFile(_ url: URL) {
         let normalizedURL = url.standardizedFileURL
         guard FileManager.default.fileExists(atPath: normalizedURL.path) else {
             filePreviewURL = nil
@@ -1269,11 +1282,16 @@ final class AppModel {
             return
         }
 
-        if filePreviewURL?.standardizedFileURL.path == normalizedURL.path {
-            NSWorkspace.shared.open(normalizedURL)
+        aiAnalysisReader = nil
+        filePreviewURL = normalizedURL
+    }
+
+    func previewOrOpen(_ url: URL) {
+        if filePreviewURL?.standardizedFileURL.path == url.standardizedFileURL.path,
+           FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
         } else {
-            aiAnalysisReader = nil
-            filePreviewURL = normalizedURL
+            previewFile(url)
         }
     }
 

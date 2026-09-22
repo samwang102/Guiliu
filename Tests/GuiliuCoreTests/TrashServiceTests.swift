@@ -10,6 +10,45 @@ struct TrashServiceTests {
 
     private let service = TrashService()
 
+    @Test("旧复制策略刷新后可删除 App 文件且仍拒绝被替换的原件")
+    func refreshedCopyPolicyPreservesDeletionEvidence() throws {
+        let fixture = try ReferenceFixture()
+        defer { fixture.remove() }
+        let file = fixture.appFiles.appendingPathComponent("legacy-attachment.txt")
+        let contents = Data("attachment".utf8)
+        try contents.write(to: file)
+        let identity = try FileIdentitySnapshot.capture(at: file)
+        let posix = try POSIXFileIdentity.captureRegularFile(at: file)
+        let legacy = makeReferenceItem(url: file, identity: identity)
+            .replacingFileIdentity(with: identity, posixIdentity: posix)
+            .replacingRoutingOperation(.copy)
+        let refreshed = legacy.replacingRoutingOperation(.reference)
+        #expect(refreshed.id == legacy.id)
+        #expect(refreshed.sourceID == legacy.sourceID)
+        #expect(refreshed.persistentIdentity == identity.persistentIdentity)
+        #expect(refreshed.posixIdentity == posix)
+        let trashService = fakeTrashService(in: fixture.fakeTrash)
+        let deleted = try trashService.trash(
+            item: refreshed, allowedRoot: fixture.appFiles,
+            allowAppManagedOriginal: true, expectedPOSIXIdentity: refreshed.posixIdentity
+        )
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        #expect(try Data(contentsOf: URL(fileURLWithPath: deleted.trashedPath)) == contents)
+
+        // The refresh must not authorize a replacement appearing at the old path.
+        try contents.write(to: file)
+        if let date = identity.modificationDate {
+            try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: file.path)
+        }
+        expectError(.fileChanged) {
+            _ = try trashService.trash(
+                item: refreshed, allowedRoot: fixture.appFiles,
+                allowAppManagedOriginal: true, expectedPOSIXIdentity: refreshed.posixIdentity
+            )
+        }
+        #expect(try Data(contentsOf: file) == contents)
+    }
+
     @Test("受监控目录内未变化的普通文件通过校验")
     func validatesRegularFile() throws {
         let fixture = try Fixture()

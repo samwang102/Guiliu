@@ -42,15 +42,17 @@ final class QuickArchivePanelController {
             archive: { [weak self] category, completion in
                 self?.archive(itemID: itemID, to: category, completion: completion)
             },
-            delete: { [weak self] in self?.delete(itemID: itemID) },
+            delete: { [weak self] completion in
+                self?.delete(itemID: itemID, completion: completion)
+            },
             later: { [weak self] in self?.finish(itemID: itemID) },
             openInbox: { [weak self] in self?.openInbox(itemID: itemID) }
         )
 
-        let size = NSSize(width: 430, height: 246)
+        let size = NSSize(width: 360, height: 178)
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
-            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -94,18 +96,21 @@ final class QuickArchivePanelController {
         }
     }
 
-    private func delete(itemID: UUID) {
+    private func delete(itemID: UUID, completion: @escaping (String?) -> Void) {
         guard let model,
               let item = model.pendingItems.first(where: { $0.id == itemID }) else {
             finish(itemID: itemID)
             return
         }
-        model.delete(item)
+        model.delete(item, completion: completion)
     }
 
     private func openInbox(itemID: UUID) {
         guard let model else { return }
         model.navigate(to: .inbox)
+        if let item = model.pendingItems.first(where: { $0.id == itemID }) {
+            model.previewFile(item.url)
+        }
         NSApp.activate(ignoringOtherApps: true)
         NSApp.windows
             .first(where: { !($0 is NSPanel) })?
@@ -125,18 +130,19 @@ final class QuickArchivePanelController {
 private struct QuickArchivePanelView: View {
     let item: InboxItem
     let archive: (FileCategory, @escaping (String?) -> Void) -> Void
-    let delete: () -> Void
+    let delete: (@escaping (String?) -> Void) -> Void
     let later: () -> Void
     let openInbox: () -> Void
 
     @State private var selectedCategory: FileCategory
     @State private var isSubmitting = false
     @State private var submissionError: String?
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     init(
         item: InboxItem,
         archive: @escaping (FileCategory, @escaping (String?) -> Void) -> Void,
-        delete: @escaping () -> Void,
+        delete: @escaping (@escaping (String?) -> Void) -> Void,
         later: @escaping () -> Void,
         openInbox: @escaping () -> Void
     ) {
@@ -149,24 +155,25 @@ private struct QuickArchivePanelView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
                 Image(nsImage: GuiliuFileIcon.image(for: item.url))
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 34, height: 34)
-                    .padding(7)
+                    .frame(width: 28, height: 28)
+                    .padding(5)
                     .background(selectedCategory.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("新文件，放到哪里？")
-                        .font(.headline.weight(.bold))
                     Text(item.url.lastPathComponent)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(item.url.lastPathComponent)
                     Text("\(item.sourceDisplayName) · \(ByteCountFormatter.string(fromByteCount: item.fileSize, countStyle: .file))")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
 
                 Spacer(minLength: 4)
@@ -179,7 +186,7 @@ private struct QuickArchivePanelView: View {
                 .help("稍后处理")
             }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Text("归档到")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -213,28 +220,29 @@ private struct QuickArchivePanelView: View {
                 .menuStyle(.borderlessButton)
             }
 
-            HStack(spacing: 9) {
-                if item.routingOperation != .copy {
-                    Button(action: delete) {
-                        Label(
-                            item.routingOperation == .reference ? "原件移到废纸篓" : "移到废纸篓",
-                            systemImage: "trash"
-                        )
+            HStack(spacing: 12) {
+                Button {
+                    isSubmitting = true
+                    submissionError = nil
+                    delete { message in
+                        isSubmitting = false
+                        submissionError = message
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.red)
-                    .help(item.routingOperation == .reference
-                        ? "将 App 原件移到废纸篓，可从操作记录恢复"
-                        : "移到废纸篓，可从操作记录恢复")
-                    .accessibilityLabel(item.routingOperation == .reference
-                        ? "将 App 原件移到废纸篓"
-                        : "将文件移到废纸篓")
+                } label: {
+                    Label("删除", systemImage: "trash")
                 }
-                Button("在归流中查看", action: openInbox)
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+                .help(item.routingOperation == .reference
+                    ? "将 App 原件移到废纸篓，可从操作记录恢复"
+                    : "移到废纸篓，可从操作记录恢复")
+                .accessibilityLabel(item.routingOperation == .reference
+                    ? "将 App 原件移到废纸篓"
+                    : "将文件移到废纸篓")
+
+                Button("预览", action: openInbox)
                     .buttonStyle(.borderless)
                 Spacer()
-                Button("稍后", action: later)
-                    .buttonStyle(.bordered)
                 Button {
                     isSubmitting = true
                     submissionError = nil
@@ -247,7 +255,7 @@ private struct QuickArchivePanelView: View {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Label("立即归档", systemImage: item.routingOperation == .reference ? "link" : "arrow.right")
+                        Label("归档", systemImage: item.routingOperation == .reference ? "link" : "arrow.right")
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -260,18 +268,26 @@ private struct QuickArchivePanelView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .lineLimit(2)
-                    .accessibilityLabel("归档失败：\(submissionError)")
+                    .help(submissionError)
+                    .accessibilityLabel("操作失败：\(submissionError)")
             } else {
-                Text("归档完成后此提示会自动关闭")
+                Text(item.routingOperation == .reference ? "引用归档 · 删除会将 App 原件移到废纸篓" : "关闭可稍后处理 · 删除的文件可从废纸篓恢复")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(17)
-        .frame(width: 430, height: 246)
-        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .disabled(isSubmitting)
+        .padding(13)
+        .frame(width: 360, height: 178)
+        .background {
+            if reduceTransparency {
+                RoundedRectangle(cornerRadius: 16).fill(Color(nsColor: .windowBackgroundColor))
+            } else {
+                RoundedRectangle(cornerRadius: 16).fill(.ultraThinMaterial)
+            }
+        }
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.primary.opacity(0.10), lineWidth: 1)
         }
     }

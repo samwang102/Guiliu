@@ -1,3 +1,4 @@
+import AppKit
 import GuiliuCore
 import QuickLookThumbnailing
 import SwiftUI
@@ -11,41 +12,65 @@ struct InboxView: View {
             if model.pendingItems.isEmpty {
                 EmptyInboxView()
             } else {
-                HStack(spacing: 0) {
-                    triageQueue
-                        .frame(width: 286)
-
-                    Divider().opacity(0.7)
-
-                    if let item = selectedItem {
-                        GuiliuBackToTopScrollView {
-                            VStack(spacing: 14) {
-                                InboxHeader()
-
-                                RoutingCard(item: item) {
-                                    withAnimation(.snappy) {
-                                        model.delete(item)
-                                    }
-                                }
-                                .id(item.id)
-                            }
-                            .frame(maxWidth: 880)
-                            .padding(.horizontal, 22)
-                            .padding(.top, 18)
-                            .padding(.bottom, 32)
-                            .frame(maxWidth: .infinity)
-                        }
+                GeometryReader { geometry in
+                    // Keep the file queue reachable when the shared reader opens.
+                    // A fourth fixed column would leave too little room to classify.
+                    let compact = geometry.size.width < 740
+                    let layout = compact
+                        ? AnyLayout(VStackLayout(spacing: 0))
+                        : AnyLayout(HStackLayout(spacing: 0))
+                    layout {
+                        triageQueue
+                            .frame(width: compact ? nil : 250)
+                            .frame(height: compact ? min(190, geometry.size.height * 0.34) : nil)
+                        Divider().opacity(0.7)
+                        routingDetail
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }
         }
         .navigationTitle("待归类")
         .onAppear {
+            selectPreviewedItemIfNeeded()
             selectFirstItemIfNeeded()
         }
         .onChange(of: model.pendingItems.map(\.id)) { _, _ in
+            let removedSelection = selectedItemID.map { id in
+                !model.pendingItems.contains(where: { $0.id == id })
+            } ?? false
             selectFirstItemIfNeeded()
+            if removedSelection, model.filePreviewURL != nil {
+                if let item = selectedItem { model.previewFile(item.url) }
+                else { model.closeFilePreview() }
+            }
         }
+        .onChange(of: model.filePreviewURL) { _, _ in
+            selectPreviewedItemIfNeeded()
+        }
+    }
+
+    private var routingDetail: some View {
+        GuiliuBackToTopScrollView {
+            if let item = selectedItem {
+                VStack(spacing: 14) {
+                    InboxHeader()
+                    RoutingCard(item: item) { model.delete(item) }
+                        .id(item.id)
+                }
+                .frame(maxWidth: 880)
+                .padding(.horizontal, 14)
+                .padding(.top, 14)
+                .padding(.bottom, 24)
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func selectPreviewedItemIfNeeded() {
+        guard let path = model.filePreviewURL?.standardizedFileURL.path,
+              let item = model.pendingItems.first(where: { $0.url.standardizedFileURL.path == path }) else { return }
+        selectedItemID = item.id
     }
 
     private var selectedItem: InboxItem? {
@@ -70,7 +95,7 @@ struct InboxView: View {
                         .padding(.vertical, 3)
                         .background(GuiliuTheme.brand.opacity(0.11), in: Capsule())
                 }
-                Text("选中文件，在右侧一次完成判断与归档")
+                Text("点击预览内容，再选择归档分类")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -84,6 +109,7 @@ struct InboxView: View {
                             selected: selectedItem?.id == item.id
                         ) {
                             selectedItemID = item.id
+                            model.previewOrOpen(item.url)
                         }
                     }
                 }
@@ -192,7 +218,7 @@ private struct InboxHeader: View {
         VStack(alignment: .leading, spacing: 5) {
             Text("确认当前文件的去向")
                 .font(.title3.weight(.bold))
-            Text("左侧切换文件；推荐分类可以修改，处理完成后自动进入下一项。")
+            Text("点击队列或文件名预览；归档后自动进入下一项。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -330,12 +356,22 @@ private struct RoutingCard: View {
         HStack(alignment: .top, spacing: 14) {
             FileThumbnail(url: item.url, tint: selectedCategory.tint)
                 .frame(width: 66, height: 66)
+                .contentShape(Rectangle())
+                .onTapGesture { model.previewFile(item.url) }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel("预览 \(item.url.lastPathComponent)")
+                .accessibilityAction { model.previewFile(item.url) }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(item.url.lastPathComponent)
-                    .font(.headline.weight(.semibold))
-                    .lineLimit(2)
-                    .textSelection(.enabled)
+                Button { model.previewFile(item.url) } label: {
+                    Text(item.url.lastPathComponent)
+                        .font(.headline.weight(.semibold))
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("预览文件内容")
 
                 HStack(spacing: 6) {
                     Label(item.origin.displayName, systemImage: item.origin.symbolName)
@@ -418,7 +454,7 @@ private struct RoutingCard: View {
     }
 
     private var fileOptions: some View {
-        HStack(spacing: 11) {
+        VStack(alignment: .leading, spacing: 8) {
             if isProcessing {
                 ProgressView()
                     .controlSize(.small)
@@ -436,13 +472,25 @@ private struct RoutingCard: View {
                 Toggle("以后 .\(item.url.pathExtension.lowercased()) 默认归入这里", isOn: $rememberExtension)
                     .toggleStyle(.checkbox)
                     .font(.caption)
-                    .fixedSize()
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
     private var actions: some View {
         HStack(spacing: 8) {
+            Button { model.previewFile(item.url) } label: {
+                Image(systemName: "eye")
+            }
+            .help("预览文件内容")
+            .accessibilityLabel("预览文件内容")
+
+            Button(role: .destructive, action: onDelete) {
+                Image(systemName: "trash")
+            }
+            .help(item.routingOperation == .reference ? "将 App 原件移到废纸篓" : "移到废纸篓")
+            .accessibilityLabel(item.routingOperation == .reference ? "将 App 原件移到废纸篓" : "移到废纸篓")
+
             RenameFileButton(
                 fileURL: item.url,
                 isEnabled: model.canRename(item),
@@ -461,14 +509,13 @@ private struct RoutingCard: View {
                 Button("暂时忽略") {
                     withAnimation(.snappy) { model.ignore(item) }
                 }
-                if item.routingOperation != .copy {
-                    Divider()
-                    Button(
-                        item.routingOperation == .reference ? "App 原件移到废纸篓" : "移到废纸篓",
-                        role: .destructive,
-                        action: onDelete
-                    )
-                }
+                Divider()
+                Button("打开文件") { NSWorkspace.shared.open(item.url) }
+                Button(
+                    item.routingOperation == .reference ? "App 原件移到废纸篓" : "移到废纸篓",
+                    role: .destructive,
+                    action: onDelete
+                )
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 18)
@@ -481,9 +528,10 @@ private struct RoutingCard: View {
                     model.route(item, to: selectedCategory, rememberExtension: rememberExtension)
                 }
             } label: {
-                Label(actionTitle, systemImage: actionSymbol)
+                Label("归档", systemImage: actionSymbol)
             }
             .buttonStyle(.borderedProminent)
+            .help(actionTitle)
             .accessibilityLabel("将 \(item.url.lastPathComponent) \(item.routingOperation.actionName)到 \(selectedCategory.displayName)")
         }
     }

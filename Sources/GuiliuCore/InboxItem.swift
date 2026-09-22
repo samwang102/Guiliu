@@ -149,6 +149,19 @@ public struct InboxItem: Codable, Identifiable, Hashable, Sendable {
         )
     }
 
+    /// Refreshes only the routing policy; saved file identity remains authoritative.
+    public func replacingRoutingOperation(_ operation: RoutingOperation) -> InboxItem {
+        InboxItem(
+            id: id, url: url, detectedAt: detectedAt, fileSize: fileSize,
+            suggestion: suggestion, origin: origin, routingOperation: operation,
+            sourceID: sourceID, sourceDisplayName: sourceDisplayName, tags: tags,
+            modificationDate: modificationDate, resourceIdentifier: resourceIdentifier,
+            resourceIdentifierSession: resourceIdentifierSession,
+            persistentIdentity: persistentIdentity, posixIdentity: posixIdentity,
+            aiSummary: aiSummary, aiModel: aiModel, aiAnalyzedAt: aiAnalyzedAt
+        )
+    }
+
     public func replacingURL(_ newURL: URL) -> InboxItem {
         InboxItem(
             id: id,
