@@ -739,6 +739,7 @@ final class AppModel {
                 to: URL(fileURLWithPath: record.destinationPath)
             )
             pendingItems.removeAll { $0.id == item.id }
+            advancePendingPreview(afterRemoving: item.url, destination: URL(fileURLWithPath: record.destinationPath))
             quickArchivePanel.itemDidLeaveQueue(item.id)
             persistPendingItems()
             stability.removeValue(forKey: item.url.path)
@@ -776,6 +777,7 @@ final class AppModel {
         knownPaths.insert(item.url.path)
         stability.removeValue(forKey: item.url.path)
         pendingItems.removeAll { $0.id == item.id }
+        advancePendingPreview(afterRemoving: item.url)
         quickArchivePanel.itemDidLeaveQueue(item.id)
         persistPendingItems()
         if let handledFingerprint = fingerprint(for: item) {
@@ -897,6 +899,7 @@ final class AppModel {
                 to: URL(fileURLWithPath: record.trashedPath)
             )
             pendingItems.removeAll { $0.id == item.id }
+            advancePendingPreview(afterRemoving: item.url, destination: URL(fileURLWithPath: record.trashedPath))
             quickArchivePanel.itemDidLeaveQueue(item.id)
             persistPendingItems()
             stability.removeValue(forKey: item.url.path)
@@ -1272,6 +1275,19 @@ final class AppModel {
     func closeContextReader() {
         aiAnalysisReader = nil
         filePreviewURL = nil
+    }
+
+    /// Keep previews coherent even when a floating panel processes a file while
+    /// the inbox window is closed and its view callbacks are not running.
+    private func advancePendingPreview(afterRemoving source: URL, destination: URL? = nil) {
+        guard let displayedPath = filePreviewURL?.standardizedFileURL.path,
+              displayedPath == source.standardizedFileURL.path
+                || displayedPath == destination?.standardizedFileURL.path else { return }
+        if selection == .inbox, let next = pendingItems.first {
+            previewFile(next.url)
+        } else {
+            closeFilePreview()
+        }
     }
 
     func previewFile(_ url: URL) {

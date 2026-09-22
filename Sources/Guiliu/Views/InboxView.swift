@@ -20,11 +20,11 @@ struct InboxView: View {
                         ? AnyLayout(VStackLayout(spacing: 0))
                         : AnyLayout(HStackLayout(spacing: 0))
                     layout {
-                        triageQueue
+                        triageQueue(compact: compact)
                             .frame(width: compact ? nil : 250)
                             .frame(height: compact ? min(190, geometry.size.height * 0.34) : nil)
                         Divider().opacity(0.7)
-                        routingDetail
+                        routingDetail(compact: compact)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -50,11 +50,11 @@ struct InboxView: View {
         }
     }
 
-    private var routingDetail: some View {
+    private func routingDetail(compact: Bool) -> some View {
         GuiliuBackToTopScrollView {
             if let item = selectedItem {
                 VStack(spacing: 14) {
-                    InboxHeader()
+                    if !compact { InboxHeader() }
                     RoutingCard(item: item) { model.delete(item) }
                         .id(item.id)
                 }
@@ -81,7 +81,7 @@ struct InboxView: View {
         return model.pendingItems.first
     }
 
-    private var triageQueue: some View {
+    private func triageQueue(compact: Bool) -> some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
@@ -95,13 +95,15 @@ struct InboxView: View {
                         .padding(.vertical, 3)
                         .background(GuiliuTheme.brand.opacity(0.11), in: Capsule())
                 }
-                Text("点击预览内容，再选择归档分类")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if !compact {
+                    Text("点击预览内容，再选择归档分类")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(15)
 
-            GuiliuBackToTopScrollView {
+            GuiliuBackToTopScrollView(scrollToID: selectedItemID.map(AnyHashable.init)) {
                 LazyVStack(spacing: 5) {
                     ForEach(model.pendingItems) { item in
                         TriageQueueRow(
@@ -111,24 +113,27 @@ struct InboxView: View {
                             selectedItemID = item.id
                             model.previewOrOpen(item.url)
                         }
+                        .id(item.id)
                     }
                 }
                 .padding(.horizontal, 9)
                 .padding(.bottom, 12)
             }
 
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(model.isMonitoring ? GuiliuTheme.success : .secondary)
-                    .frame(width: 7, height: 7)
-                Text(model.isMonitoring ? "新文件会自动加入队列" : "监控已暂停")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
+            if !compact {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(model.isMonitoring ? GuiliuTheme.success : .secondary)
+                        .frame(width: 7, height: 7)
+                    Text(model.isMonitoring ? "新文件会自动加入队列" : "监控已暂停")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(13)
+                .background(GuiliuTheme.surface)
+                .overlay(alignment: .top) { Divider().opacity(0.55) }
             }
-            .padding(13)
-            .background(GuiliuTheme.surface)
-            .overlay(alignment: .top) { Divider().opacity(0.55) }
         }
         .background(GuiliuTheme.sidebar.opacity(0.62))
     }
@@ -324,8 +329,10 @@ private struct RoutingCard: View {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
                     fileOptions
+                        .fixedSize(horizontal: true, vertical: false)
                     Spacer(minLength: 12)
                     actions
+                        .fixedSize(horizontal: true, vertical: false)
                 }
 
                 VStack(alignment: .leading, spacing: 12) {

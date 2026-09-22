@@ -275,13 +275,16 @@ struct GuiliuBackToTopScrollView<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsBackToTop = false
     private let showsIndicators: Bool
+    private let scrollToID: AnyHashable?
     private let content: () -> Content
     private let topAnchor = "guiliu-scroll-top"
     init(
         showsIndicators: Bool = true,
+        scrollToID: AnyHashable? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.showsIndicators = showsIndicators
+        self.scrollToID = scrollToID
         self.content = content
     }
 
@@ -299,6 +302,10 @@ struct GuiliuBackToTopScrollView<Content: View>: View {
                     .id(topAnchor)
 
                 content()
+            }
+            .onChange(of: scrollToID, initial: true) { _, target in
+                guard let target else { return }
+                DispatchQueue.main.async { proxy.scrollTo(target, anchor: .center) }
             }
             .overlay(alignment: .bottomTrailing) {
                 if showsBackToTop {
